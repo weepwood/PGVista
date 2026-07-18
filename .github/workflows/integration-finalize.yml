@@ -1,0 +1,299 @@
+name: PGVista Integration Finalization
+
+on:
+  issues:
+    types: [opened]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: pgvista-integration-finalize
+  cancel-in-progress: false
+
+jobs:
+  integration:
+    if: github.event_name == 'workflow_dispatch' || github.event.issue.title == 'validate-pgvista-integration'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore source only when missing
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f backend/cmd/server/main.go ]; then
+            test -n "$(compgen -G 'bootstrap/part-*')"
+            cat bootstrap/part-* > /tmp/PGVista-source.tar.gz.b64
+            echo "877ee18ef6157261e8b3becccc0fa5d0321f45b67b0f0fa33a5c01b06f293356  /tmp/PGVista-source.tar.gz.b64" | sha256sum -c -
+            base64 --decode /tmp/PGVista-source.tar.gz.b64 > /tmp/PGVista-source.tar.gz
+            echo "493c205c5a6917486761f802afda0c378239e623f1361c0d57b96412300087b8  /tmp/PGVista-source.tar.gz" | sha256sum -c -
+            tar -xzf /tmp/PGVista-source.tar.gz
+          fi
+
+      - name: Normalize runtime-sensitive source
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          response = Path('backend/internal/api/response.go')
+          text = response.read_text()
+          text = re.sub(
+              r'\nfunc username\(c \*gin\.Context\) string \{\n\tvalue, _ := c\.Get\("username"\)\n\tname, _ := value\.\(string\)\n\treturn name\n\}\n?$',
+              '\n',
+              text,
+          )
+          response.write_text(text)
+
+          migration = Path('backend/internal/database/migrations/001_init.sql')
+          text = migration.read_text()
+          text = re.sub(
+              r"BEGIN\s+INSERT INTO lab\.audit_log\(table_name,action,row_data\)\s+VALUES\('product',TG_OP,to_jsonb\(COALESCE\(NEW,OLD\)\)\);\s+RETURN COALESCE\(NEW,OLD\);\s+END;",
+              """BEGIN
+              IF TG_OP = 'DELETE' THEN
+                  INSERT INTO lab.audit_log(table_name,action,row_data)
+                  VALUES('product',TG_OP,to_jsonb(OLD));
+                  RETURN OLD;
+              END IF;
+              INSERT INTO lab.audit_log(table_name,action,row_data)
+              VALUES('product',TG_OP,to_jsonb(NEW));
+              RETURN NEW;
+          END;""",
+              text,
+              flags=re.S,
+          )
+          migration.write_text(text)
+
+          for name in ('docker-compose.yml', 'deploy/compose.prod.yml'):
+              path = Path(name)
+              path.write_text(path.read_text().replace(
+                  'postgres-data:/var/lib/postgresql/data',
+                  'postgres-data:/var/lib/postgresql',
+              ))
+
+          operations = Path('backend/internal/operations/service.go')
+          text = operations.read_text()
+          text = text.replace("VALUES($1,$2,$3,$4,'running',now(),$5)", "VALUES($1,$2,$3,$4,'running',now(),$5::jsonb)")
+          text = text.replace("VALUES($1,$2,$3,$4,$5,$6,now(),$7,$8)", "VALUES($1,$2,$3,$4,$5::jsonb,$6::jsonb,now(),$7,$8)")
+          text = text.replace("response_data=$4, error_message=$5", "response_data=$4::jsonb, error_message=$5")
+          text = text.replace("operationType, payload)", "operationType, string(payload))")
+          text = text.replace("name, inJSON, outJSON, ms, status)", "name, string(inJSON), string(outJSON), ms, status)")
+          text = text.replace("time.Since(t.start).Milliseconds(), payload, errorText)", "time.Since(t.start).Milliseconds(), string(payload), errorText)")
+          operations.write_text(text)
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Resolve dependencies and normalize source
+        run: |
+          cd backend
+          go mod tidy
+          gofmt -w .
+          cd ../frontend
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+          npm ci --no-audit --no-fund
+          cd ..
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('frontend/Dockerfile')
+          text = path.read_text()
+          text = text.replace('COPY package.json ./\nRUN npm install --no-audit --no-fund', 'COPY package.json package-lock.json ./\nRUN npm ci --no-audit --no-fund')
+          text = text.replace('COPY package*.json ./\nRUN npm ci', 'COPY package.json package-lock.json ./\nRUN npm ci')
+          path.write_text(text)
+          PY
+
+      - name: Publish clean normalized source
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bootstrap frontend/dist backend/coverage.out
+          rm -f .github/workflows/bootstrap.yml
+          rm -f .github/workflows/issue-bootstrap.yml
+          rm -f .github/workflows/repository-bootstrap.yml
+          rm -f .github/workflows/postgres18-volume-fix.yml
+          rm -f .github/workflows/final-validation.yml
+          rm -f .github/workflows/finalize-pgvista.yml
+          rm -f .github/workflows/integration-finalize.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "fix: normalize PGVista runtime integration"
+            git pull --rebase origin main
+            git push origin main
+          fi
+
+      - name: Static validation
+        run: |
+          cd backend
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test -race ./...
+          cd ../frontend
+          npm run typecheck
+          npm run lint
+          npm run build
+          npm audit --omit=dev --audit-level=high
+
+      - name: Configure integration environment
+        run: |
+          cat > .env <<'EOF'
+          POSTGRES_DB=pgvista
+          POSTGRES_USER=pgvista
+          POSTGRES_PASSWORD=pgvista-integration-password
+          JWT_SECRET=pgvista-integration-secret-at-least-32-characters
+          ADMIN_USERNAME=admin
+          ADMIN_PASSWORD=admin123
+          ALLOWED_ORIGINS=http://localhost:8088
+          STATEMENT_TIMEOUT=15s
+          MAX_QUERY_ROWS=500
+          ENABLE_DANGEROUS_SQL=false
+          PGVISTA_VERSION=latest
+          EOF
+
+      - name: Start complete stack
+        run: docker compose up -d --build
+
+      - name: Wait for services
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://localhost:8080/healthz >/dev/null && curl --fail --silent http://localhost:8088/healthz >/dev/null; then
+              exit 0
+            fi
+            sleep 3
+          done
+          docker compose ps
+          docker compose logs --tail=300
+          exit 1
+
+      - name: Exercise API, database features and operation tracing
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOGIN=$(curl --fail --silent -X POST http://localhost:8080/api/v1/auth/login \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"admin","password":"admin123"}')
+          TOKEN=$(python -c 'import json,sys; print(json.load(sys.stdin)["data"]["token"])' <<<"$LOGIN")
+          AUTH="Authorization: Bearer $TOKEN"
+
+          curl --fail --silent http://localhost:8080/api/v1/dashboard -H "$AUTH" > /tmp/dashboard.json
+          curl --fail --silent http://localhost:8080/api/v1/catalog/schemas -H "$AUTH" > /tmp/schemas.json
+          curl --fail --silent http://localhost:8080/api/v1/catalog/schemas/lab/tables -H "$AUTH" > /tmp/tables.json
+          curl --fail --silent http://localhost:8080/api/v1/catalog/schemas/lab/tables/product -H "$AUTH" > /tmp/product-table.json
+          curl --fail --silent 'http://localhost:8080/api/v1/data/lab/product?limit=10&offset=0' -H "$AUTH" > /tmp/products.json
+
+          curl --fail --silent -X POST http://localhost:8080/api/v1/data/lab/customer \
+            -H "$AUTH" -H 'Content-Type: application/json' \
+            -d '{"email":"integration@example.com","display_name":"Integration Test","profile":{"source":"github-actions"}}' \
+            > /tmp/insert.json
+
+          curl --fail --silent -X POST http://localhost:8080/api/v1/sql/execute \
+            -H "$AUTH" -H 'Content-Type: application/json' \
+            -d '{"sql":"SELECT id, sku, name, stock FROM lab.product WHERE stock > $1 ORDER BY id","parameters":[0],"readOnly":true}' \
+            > /tmp/sql-select.json
+
+          curl --fail --silent -X POST http://localhost:8080/api/v1/sql/explain \
+            -H "$AUTH" -H 'Content-Type: application/json' \
+            -d '{"sql":"SELECT * FROM lab.product WHERE sku = $1","parameters":["PG-BOOK-001"],"analyze":false}' \
+            > /tmp/explain.json
+
+          curl --fail --silent -X POST http://localhost:8080/api/v1/sql/execute \
+            -H "$AUTH" -H 'Content-Type: application/json' \
+            -d '{"sql":"UPDATE lab.product SET stock = stock WHERE id = 1 RETURNING id","parameters":[],"readOnly":false}' \
+            > /tmp/sql-update.json
+
+          curl --fail --silent -X POST http://localhost:8080/api/v1/sql/execute \
+            -H "$AUTH" -H 'Content-Type: application/json' \
+            -d '{"sql":"SELECT count(*) AS audit_count FROM lab.audit_log WHERE table_name = $1","parameters":["product"],"readOnly":true}' \
+            > /tmp/audit.json
+
+          curl --fail --silent http://localhost:8080/api/v1/monitor/activity -H "$AUTH" > /tmp/activity.json
+          curl --fail --silent http://localhost:8080/api/v1/monitor/locks -H "$AUTH" > /tmp/locks.json
+          curl --fail --silent 'http://localhost:8080/api/v1/operations?limit=100' -H "$AUTH" > /tmp/operations.json
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          required = {
+              'dashboard': '/tmp/dashboard.json',
+              'schemas': '/tmp/schemas.json',
+              'tables': '/tmp/tables.json',
+              'products': '/tmp/products.json',
+              'insert': '/tmp/insert.json',
+              'select': '/tmp/sql-select.json',
+              'explain': '/tmp/explain.json',
+              'audit': '/tmp/audit.json',
+              'operations': '/tmp/operations.json',
+          }
+          payloads = {name: json.loads(Path(path).read_text()) for name, path in required.items()}
+          for name, payload in payloads.items():
+              if 'error' in payload:
+                  raise SystemExit(f'{name} returned error: {payload}')
+              if 'data' not in payload:
+                  raise SystemExit(f'{name} did not return data: {payload}')
+          rows = payloads['products']['data']['rows']
+          if not rows:
+              raise SystemExit('lab.product returned no seeded rows')
+          operations = payloads['operations']['data']
+          if len(operations) < 4:
+              raise SystemExit(f'expected operation traces, got {len(operations)}')
+          audit_rows = payloads['audit']['data']['rows']
+          if not audit_rows or int(audit_rows[0]['audit_count']) < 1:
+              raise SystemExit('product trigger did not create an audit record')
+          PY
+
+      - name: Record successful integration validation
+        shell: bash
+        run: |
+          cat > docs/integration-validation.md <<EOF
+          # PGVista v0.1.0 Integration Validation
+
+          The complete Docker Compose stack passed an integration smoke test using PostgreSQL 18.
+
+          Verified paths:
+
+          - administrator login and JWT authentication
+          - dashboard statistics
+          - schema, table, column and index catalog browsing
+          - generic table data browsing and row insertion
+          - parameterized read-only SQL execution
+          - JSON execution plans
+          - committed update transaction
+          - product audit trigger
+          - PostgreSQL activity and lock endpoints
+          - operation trace persistence
+          - Vue/Nginx and Go health endpoints
+
+          Validated by GitHub Actions from workflow commit: \`${GITHUB_SHA}\`
+          EOF
+          git add docs/integration-validation.md
+          git commit -m "docs: record PGVista integration validation"
+          git pull --rebase origin main
+          git push origin main
+
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose logs --tail=500 || true
+
+      - name: Stop integration stack
+        if: always()
+        run: docker compose down -v --remove-orphans || true
+
+      - name: Close integration issue
+        if: success() && github.event_name == 'issues'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh issue close "${{ github.event.issue.number }}" --comment "PGVista v0.1.0 passed the full PostgreSQL 18 integration smoke test."
