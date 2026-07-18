@@ -1,0 +1,127 @@
+name: Publish PGVista Source
+
+on:
+  issues:
+    types: [opened]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  publish:
+    if: github.event_name == 'workflow_dispatch' || github.event.issue.title == 'bootstrap-pgvista-source-v2'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore source when bootstrap parts exist
+        shell: bash
+        run: |
+          set -euo pipefail
+          if compgen -G 'bootstrap/part-*' > /dev/null; then
+            cat bootstrap/part-* > /tmp/PGVista-source.tar.gz.b64
+            echo "877ee18ef6157261e8b3becccc0fa5d0321f45b67b0f0fa33a5c01b06f293356  /tmp/PGVista-source.tar.gz.b64" | sha256sum -c -
+            base64 --decode /tmp/PGVista-source.tar.gz.b64 > /tmp/PGVista-source.tar.gz
+            echo "493c205c5a6917486761f802afda0c378239e623f1361c0d57b96412300087b8  /tmp/PGVista-source.tar.gz" | sha256sum -c -
+            tar -xzf /tmp/PGVista-source.tar.gz
+          fi
+
+      - name: Apply bootstrap corrections
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          response = Path('backend/internal/api/response.go')
+          if response.exists():
+              text = response.read_text()
+              text = re.sub(
+                  r'\nfunc username\(c \*gin\.Context\) string \{\n\tvalue, _ := c\.Get\("username"\)\n\tname, _ := value\.\(string\)\n\treturn name\n\}\n?$',
+                  '\n',
+                  text,
+              )
+              response.write_text(text)
+
+          migration = Path('backend/internal/database/migrations/001_init.sql')
+          if migration.exists():
+              text = migration.read_text()
+              old = """BEGIN
+    INSERT INTO lab.audit_log(table_name,action,row_data)
+    VALUES('product',TG_OP,to_jsonb(COALESCE(NEW,OLD)));
+    RETURN COALESCE(NEW,OLD);
+END;"""
+              new = """BEGIN
+    IF TG_OP = 'DELETE' THEN
+        INSERT INTO lab.audit_log(table_name,action,row_data)
+        VALUES('product',TG_OP,to_jsonb(OLD));
+        RETURN OLD;
+    END IF;
+    INSERT INTO lab.audit_log(table_name,action,row_data)
+    VALUES('product',TG_OP,to_jsonb(NEW));
+    RETURN NEW;
+END;"""
+              migration.write_text(text.replace(old, new))
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+
+      - name: Resolve and format Go source
+        working-directory: backend
+        run: |
+          go mod tidy
+          gofmt -w .
+
+      - name: Publish complete source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bootstrap frontend/dist
+          rm -f .github/workflows/bootstrap.yml
+          rm -f .github/workflows/issue-bootstrap.yml
+          rm -f .github/workflows/repository-bootstrap.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "feat: publish PGVista full-stack platform"
+            git push
+          fi
+
+      - name: Verify backend
+        working-directory: backend
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test -race ./...
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Verify frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run typecheck
+          npm run lint
+          npm run build
+          npm audit --omit=dev --audit-level=high
+
+      - name: Verify container builds
+        run: |
+          docker build -t pgvista-backend:bootstrap ./backend
+          docker build -t pgvista-frontend:bootstrap ./frontend
+
+      - name: Close bootstrap issue
+        if: github.event_name == 'issues'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh issue close "${{ github.event.issue.number }}" --comment "PGVista source was published and the bootstrap validation completed."
