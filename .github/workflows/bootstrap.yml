@@ -1,0 +1,77 @@
+name: Bootstrap PGVista
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/bootstrap.yml
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap:
+    name: Restore and verify source
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out bootstrap repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reconstruct and verify source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat bootstrap/part-* > /tmp/PGVista-source.tar.gz.b64
+          echo "877ee18ef6157261e8b3becccc0fa5d0321f45b67b0f0fa33a5c01b06f293356  /tmp/PGVista-source.tar.gz.b64" | sha256sum -c -
+          base64 --decode /tmp/PGVista-source.tar.gz.b64 > /tmp/PGVista-source.tar.gz
+          echo "493c205c5a6917486761f802afda0c378239e623f1361c0d57b96412300087b8  /tmp/PGVista-source.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/PGVista-source.tar.gz
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache-dependency-path: backend/go.sum
+
+      - name: Resolve Go dependencies
+        working-directory: backend
+        run: go mod tidy
+
+      - name: Publish the complete source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bootstrap .github/workflows/bootstrap.yml frontend/dist
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat: publish PGVista full-stack platform"
+          git push
+
+      - name: Verify backend
+        working-directory: backend
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test -race ./...
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Verify frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run typecheck
+          npm run lint
+          npm run build
+          npm audit --omit=dev
