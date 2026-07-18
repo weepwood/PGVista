@@ -1,0 +1,91 @@
+name: Final PGVista Validation
+
+on:
+  issues:
+    types: [opened]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  validate:
+    if: github.event_name == 'workflow_dispatch' || github.event.issue.title == 'validate-pgvista-v0.1.0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache-dependency-path: backend/go.sum
+
+      - name: Validate backend
+        working-directory: backend
+        run: |
+          go mod download
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test -race -coverprofile=coverage.out ./...
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Validate frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run typecheck
+          npm run lint
+          npm run build
+          npm audit --omit=dev --audit-level=high
+
+      - name: Validate containers and Compose
+        run: |
+          docker build -t pgvista-backend:validation ./backend
+          docker build -t pgvista-frontend:validation ./frontend
+          cp .env.example .env
+          docker compose config >/dev/null
+          docker compose -f deploy/compose.prod.yml config >/dev/null
+
+      - name: Record successful validation
+        shell: bash
+        run: |
+          cat > docs/validation.md <<EOF
+          # PGVista v0.1.0 Validation
+
+          The initial full-stack release passed the repository validation workflow.
+
+          - Go formatting: passed
+          - Go vet: passed
+          - Go race-enabled tests: passed
+          - Frontend type checking: passed
+          - ESLint: passed
+          - Frontend production build: passed
+          - Production dependency audit: passed
+          - Backend container build: passed
+          - Frontend container build: passed
+          - Development Compose validation: passed
+          - Production Compose validation: passed
+
+          Validated from commit: \`${GITHUB_SHA}\`
+          EOF
+          rm -f .github/workflows/final-validation.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "docs: record PGVista v0.1.0 validation"
+          git push
+
+      - name: Close validation issue
+        if: github.event_name == 'issues'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh issue close "${{ github.event.issue.number }}" --comment "PGVista v0.1.0 passed backend, frontend, container, and Compose validation."
