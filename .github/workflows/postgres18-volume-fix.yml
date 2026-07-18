@@ -1,0 +1,52 @@
+name: PostgreSQL 18 Volume Fix
+
+on:
+  issues:
+    types: [opened]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  fix:
+    if: github.event_name == 'workflow_dispatch' || github.event.issue.title == 'fix-pgvista-postgres18-volume'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Update PostgreSQL 18 persistent volume targets
+        shell: python
+        run: |
+          from pathlib import Path
+          for name in ('docker-compose.yml', 'deploy/compose.prod.yml'):
+              path = Path(name)
+              if not path.exists():
+                  raise SystemExit(f'missing expected source file: {name}')
+              text = path.read_text()
+              text = text.replace('postgres-data:/var/lib/postgresql/data', 'postgres-data:/var/lib/postgresql')
+              path.write_text(text)
+
+      - name: Validate Compose files
+        run: |
+          cp .env.example .env
+          docker compose config >/dev/null
+          docker compose -f deploy/compose.prod.yml config >/dev/null
+
+      - name: Commit correction
+        run: |
+          rm -f .github/workflows/postgres18-volume-fix.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: use PostgreSQL 18 data volume layout"
+          git push
+
+      - name: Close issue
+        if: github.event_name == 'issues'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh issue close "${{ github.event.issue.number }}" --comment "PostgreSQL 18 volume paths were updated and Compose files validated."
